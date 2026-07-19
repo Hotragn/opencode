@@ -1056,6 +1056,61 @@ export const Info = Schema.Struct({
 }).annotate({ identifier: "Provider" })
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
 
+const MODEL_DISCOVERY_TIMEOUT = 2_000
+
+// OpenAI-compatible providers (Ollama, LM Studio, vLLM, llama.cpp, LiteLLM, ...) serve the models
+// they currently have available at GET {baseURL}/models. Discover them so users don't have to
+// hand-list every model in config. Only ids that aren't already known are added, so richer metadata
+// from models.dev or config always wins. A short timeout keeps an unreachable endpoint from blocking.
+async function discoverOpenAICompatibleModels(input: {
+  providerID: ProviderV2.ID
+  baseURL: string
+  apiKey?: string
+  headers?: Record<string, string>
+}): Promise<Record<string, Model>> {
+  const response = await fetch(input.baseURL.replace(/\/+$/, "") + "/models", {
+    headers: {
+      ...(input.apiKey ? { authorization: `Bearer ${input.apiKey}` } : {}),
+      ...input.headers,
+    },
+    signal: AbortSignal.timeout(MODEL_DISCOVERY_TIMEOUT),
+  }).catch(() => undefined)
+  if (!response?.ok) return {}
+  const body = (await response.json().catch(() => undefined)) as { data?: { id?: unknown }[] } | undefined
+  if (!Array.isArray(body?.data)) return {}
+  return Object.fromEntries(
+    body.data
+      .map((item) => item?.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0)
+      .map((id) => [id, openaiCompatibleModel(input.providerID, input.baseURL, id)] as const),
+  )
+}
+
+function openaiCompatibleModel(providerID: ProviderV2.ID, baseURL: string, id: string): Model {
+  return {
+    id: ModelV2.ID.make(id),
+    providerID,
+    api: { id, url: baseURL, npm: "@ai-sdk/openai-compatible" },
+    name: id,
+    capabilities: {
+      temperature: true,
+      reasoning: false,
+      attachment: false,
+      toolcall: true,
+      input: { text: true, audio: false, image: false, video: false, pdf: false },
+      output: { text: true, audio: false, image: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: 0, output: 0 },
+    status: "active",
+    options: {},
+    headers: {},
+    release_date: "",
+    variants: {},
+  }
+}
+
 const DefaultModelIDs = Schema.Record(Schema.String, Schema.String)
 
 export const ListResult = Schema.Struct({
@@ -1587,21 +1642,45 @@ const layer = Layer.effect(
           if (provider.name) partial.name = provider.name
           if (provider.options) partial.options = provider.options
           mergeProvider(providerID, partial)
+
+          // Register endpoint discovery for OpenAI-compatible providers that point at a baseURL
+          // (Ollama, LM Studio, vLLM, ...). The generic discoveryLoaders pass below runs it.
+          const discoveryBaseURL = provider.options?.endpoint ?? provider.options?.baseURL
+          const discoveryNpm = provider.npm ?? modelsDev[providerID]?.npm ?? "@ai-sdk/openai-compatible"
+          if (
+            typeof discoveryBaseURL === "string" &&
+            discoveryBaseURL &&
+            discoveryNpm === "@ai-sdk/openai-compatible" &&
+            !discoveryLoaders[providerID]
+          ) {
+            discoveryLoaders[providerID] = () =>
+              discoverOpenAICompatibleModels({
+                providerID,
+                baseURL: discoveryBaseURL,
+                apiKey: typeof provider.options?.apiKey === "string" ? provider.options.apiKey : undefined,
+                headers: isRecord(provider.options?.headers)
+                  ? (provider.options.headers as Record<string, string>)
+                  : undefined,
+              })
+          }
         }
 
-        const gitlab = ProviderV2.ID.make("gitlab")
-        if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab)) {
-          yield* Effect.promise(async () => {
-            try {
-              const discovered = await discoveryLoaders[gitlab]()
+        // Run every provider that registered a discovery loader (GitLab, OpenAI-compatible
+        // endpoints, ...) in parallel. Discovered ids are added only when not already present, so
+        // models.dev/config metadata wins; a slow or unreachable endpoint never blocks startup.
+        yield* Effect.promise(() =>
+          Promise.all(
+            Object.entries(discoveryLoaders).map(async ([id, discover]) => {
+              const providerID = ProviderV2.ID.make(id)
+              if (!providers[providerID] || !isProviderAllowed(providerID)) return
+              const discovered = await discover().catch(() => ({}) as Record<string, Model>)
               for (const [modelID, model] of Object.entries(discovered)) {
-                if (!providers[gitlab].models[modelID]) {
-                  providers[gitlab].models[modelID] = model
-                }
+                if (providers[providerID].models[modelID]) continue
+                providers[providerID].models[modelID] = model
               }
-            } catch (e) {}
-          })
-        }
+            }),
+          ),
+        )
 
         for (const [id, provider] of Object.entries(providers)) {
           const providerID = ProviderV2.ID.make(id)
