@@ -104,11 +104,6 @@ function executable(file: string, options?: Options, bin?: string) {
 
 const aliases = new Map<string, string | undefined>()
 
-function line(out?: string) {
-  // trim() drops the trailing CR, so splitting on the LF alone is enough
-  return out?.split("\n")[0]?.trim() || undefined
-}
-
 // Spawning where.exe costs ~300ms, and resolve() skips its own cache whenever a shell is
 // configured, so memoize both hits and misses per name.
 export function aliased(file: string) {
@@ -116,7 +111,7 @@ export function aliased(file: string) {
   const result = spawnSync("where.exe", [file], { encoding: "utf8", windowsHide: true })
   // spawnSync reports a failed launch on .error rather than throwing, so a missing or
   // blocked where.exe lands here as a miss.
-  const path = result.status === 0 ? line(result.stdout) : undefined
+  const path = result.status === 0 ? result.stdout?.split("\n")[0]?.trim() || undefined : undefined
   aliases.set(file, path)
   return path
 }
